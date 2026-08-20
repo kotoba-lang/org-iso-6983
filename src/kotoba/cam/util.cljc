@@ -18,6 +18,12 @@
    `(pad-int 1 4)` => \"0001\". Mirrors Rust's `{:0width}` integer formatting
    used for G-code program/tool numbers."
   [n width]
+  ;; Refuse a non-number instead of formatting `NaN`. `(long :em6)` yields NaN in
+  ;; ClojureScript, and "TNaN M06" is a G-code line a controller rejects — emitted
+  ;; by a generator that reported success. Fail closed at the formatter.
+  (when-not (number? n)
+    (throw (ex-info "pad-int needs a number (a NaN would be written into the G-code)"
+                    {:value n :type (type n)})))
   (let [s (str (long n))]
     (str (apply str (repeat (max 0 (- width (count s))) "0")) s)))
 

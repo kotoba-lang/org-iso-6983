@@ -8,6 +8,7 @@
             [kotoba.cam.stock :as stock]
             [kotoba.cam.tool :as tool]
             [kotoba.cam.toolpath :as toolpath]
+            [kotoba.cam.util :as util]
             [kotoba.cam.vec3 :as vec3]))
 
 (defn- sample-endmill []
@@ -268,3 +269,81 @@
 
   (let [wood (stock/wood-oak)]
     (is (< (:density wood) 1.0))))
+
+;; ---------------------------------------------------------------------
+;; Regression: the post used to write `TNaN M06` and a hardcoded spindle
+;; speed. Neither showed up in the Rust-parity tests above, because the
+;; Rust original keyed its tool library by integer and never carried a
+;; per-operation rpm into the post. Both were found by a behaviour probe
+;; that asserted properties of the emitted program rather than the shape
+;; of the call (com-junkawasaki/root, 90-docs/maturity/probes/gcode.cljs).
+;; ---------------------------------------------------------------------
+
+(defn- two-op-job []
+  (let [[lib _] (tool/add (tool/empty-library)
+                          {:id :em6 :name "6mm end mill" :tool-type :end-mill
+                           :diameter 6.0 :flute-length 20.0 :overall-length 60.0
+                           :flute-count 4 :corner-radius 0.0 :material :carbide})
+        [lib _] (tool/add lib
+                          {:id :d5 :name "5mm drill" :tool-type :drill
+                           :diameter 5.0 :flute-length 30.0 :overall-length 70.0
+                           :flute-count 2 :corner-radius 0.0 :material :carbide})]
+    (-> (toolpath/new-job (stock/block 100 100 20) lib)
+        (toolpath/add-operation
+         {:op :pocket :tool-id :em6 :depth 3.0 :stepover 2.0 :strategy :zigzag
+          :feed-rate 400.0 :spindle-rpm 8000
+          :pocket-min (vec3/v3 10.0 10.0 0.0) :pocket-max (vec3/v3 60.0 40.0 0.0)})
+        (toolpath/add-operation
+         {:op :drill :tool-id :d5 :depth 10.0 :peck-depth 3.0
+          :feed-rate 120.0 :spindle-rpm 2500 :holes [(vec3/v3 20.0 20.0 0.0)]}))))
+
+(deftest non-integer-tool-ids-get-real-tool-numbers
+  (testing "a keyword tool id becomes T01/T02 in first-appearance order"
+    (let [segments (toolpath/generate-toolpath (two-op-job))
+          text (gcode/generate-gcode segments)]
+      (is (not (str/includes? text "NaN"))
+          "a controller rejects TNaN; the generator must not report success while writing it")
+      (is (str/includes? text "T01 M06 (tool change: :em6)"))
+      (is (str/includes? text "T02 M06 (tool change: :d5)"))))
+
+  (testing "integer tool ids keep their own numbers"
+    (is (= {3 3, 7 7} (gcode/tool-numbers [{:tool-id 3} {:tool-id 7} {:tool-id 3}]))))
+
+  (testing "assignment is first-appearance order and stable"
+    (is (= {:b 1, :a 2} (gcode/tool-numbers [{:tool-id :b} {:tool-id :a} {:tool-id :b}]))))
+
+  (testing "pad-int refuses a non-number instead of formatting NaN"
+    (is (= "07" (util/pad-int 7 2)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (util/pad-int :em6 2)))))
+
+(deftest spindle-speed-comes-from-the-operation
+  (let [segments (toolpath/generate-toolpath (two-op-job))
+        text (gcode/generate-gcode segments)]
+    (testing "each operation's own rpm reaches the post"
+      (is (str/includes? text "M03 S8000 (spindle CW)"))
+      (is (str/includes? text "M03 S2500 (spindle CW)")))
+    (testing "segments carry the rpm of the operation that produced them"
+      (is (= #{8000.0 2500.0} (set (map :spindle-rpm segments)))))
+    (testing "the fallback is named in the config and announced in the program"
+      (let [bare (gcode/generate-gcode [{:segment-type :rapid :tool-id 1
+                                         :start (vec3/v3 0.0 0.0 0.0)
+                                         :end (vec3/v3 1.0 0.0 0.0) :feed-rate 0.0}])]
+        (is (str/includes? bare (str "M03 S" (:default-spindle-rpm gcode/default-config))))
+        (is (str/includes? bare "no spindle speed on this operation"))))))
+
+(deftest unimplemented-post-processors-are-refused-not-faked
+  (testing "the named set is larger than the implemented set, and says so"
+    (is (contains? gcode/post-processors :heidenhain))
+    (is (not (contains? gcode/implemented-post-processors :heidenhain)))
+    (is (contains? gcode/implemented-post-processors :fanuc)))
+
+  (let [segments (toolpath/generate-toolpath (two-op-job))]
+    (testing "the implemented target emits"
+      (is (str/includes? (gcode/generate-gcode segments gcode/default-config) "M30")))
+    (testing "an unimplemented target throws instead of returning Fanuc output under its name"
+      (doseq [post (disj gcode/post-processors :fanuc)]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                     (gcode/generate-gcode segments (assoc gcode/default-config
+                                                           :post-processor post)))
+            (str post " must be refused while its dialect is unimplemented"))))))

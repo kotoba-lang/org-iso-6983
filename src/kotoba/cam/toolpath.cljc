@@ -31,14 +31,22 @@
 (def segment-types #{:rapid :linear :arc-cw :arc-ccw})
 
 (defn segment
-  "One segment of a generated toolpath."
-  [{:keys [segment-type start end feed-rate center tool-id]}]
-  {:segment-type segment-type
-   :start start
-   :end end
-   :feed-rate (double (or feed-rate 0.0))
-   :center center
-   :tool-id tool-id})
+  "One segment of a generated toolpath.
+
+   `:spindle-rpm` is carried on the segment because the post needs it: the
+   G-code emitter writes `M03 S<rpm>` at each tool change, and the only place
+   that number exists is the operation. Generators do not have to set it —
+   `generate-toolpath` stamps each operation's rpm onto the segments that
+   operation produced (see there) — but a caller building segments by hand
+   may pass it directly."
+  [{:keys [segment-type start end feed-rate center tool-id spindle-rpm]}]
+  (cond-> {:segment-type segment-type
+           :start start
+           :end end
+           :feed-rate (double (or feed-rate 0.0))
+           :center center
+           :tool-id tool-id}
+    (some? spindle-rpm) (assoc :spindle-rpm (double spindle-rpm))))
 
 (defn- last-end
   "The end position of the last segment, or origin if empty."
@@ -314,12 +322,24 @@
   [job]
   (reduce
    (fn [segments op]
-     (case (:op op)
-       :pocket (gen-pocket job op segments)
-       :drill (gen-drill job op segments)
-       :face-mill (gen-face-mill job op segments)
-       :contour (let [result (gen-contour job op segments)]
-                  (if (= result segments) (gen-placeholder job op segments) result))
-       (:surface-3d :turn) (gen-placeholder job op segments)))
+     (let [before (count segments)
+           after (case (:op op)
+                   :pocket (gen-pocket job op segments)
+                   :drill (gen-drill job op segments)
+                   :face-mill (gen-face-mill job op segments)
+                   :contour (let [result (gen-contour job op segments)]
+                              (if (= result segments) (gen-placeholder job op segments) result))
+                   (:surface-3d :turn) (gen-placeholder job op segments))]
+       ;; Stamp this operation's spindle speed onto the segments it produced.
+       ;; Done here rather than inside each generator so the ~18 `segment` call
+       ;; sites stay unchanged: the rpm is a property of the operation, and the
+       ;; operation boundary is exactly this reduction step. Without it the post
+       ;; has no rpm to write and emits a hardcoded one — a G-code program that
+       ;; runs every tool at the same speed regardless of what the operation asked
+       ;; for, which on a real machine is a broken tool, not a cosmetic defect.
+       (if-let [rpm (:spindle-rpm op)]
+         (into (subvec (vec after) 0 before)
+               (map #(assoc % :spindle-rpm (double rpm)) (subvec (vec after) before)))
+         after)))
    []
    (:operations job)))

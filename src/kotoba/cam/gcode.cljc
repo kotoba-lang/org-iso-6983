@@ -13,7 +13,25 @@
             [kotoba.cam.util :as util]))
 
 (def machine-types #{:mill-3axis :mill-4axis :mill-5axis :lathe :laser-cutter :printer-3d})
-(def post-processors #{:fanuc :haas :siemens :heidenhain :linuxcnc :marlin :grbl})
+(def post-processors
+  "Post-processor targets this library *names*. Naming one is not implementing
+   one — see `implemented-post-processors`."
+  #{:fanuc :haas :siemens :heidenhain :linuxcnc :marlin :grbl})
+
+(def implemented-post-processors
+  "The subset `generate-gcode` actually emits a distinct dialect for.
+
+   The emitter writes ISO/Fanuc-style output: `%`/O-number program wrapper,
+   G21/G90/G54, G40/G49 cancels, T/M06 tool change, M03/M05, M08/M09, M30.
+   Haas accepts most of that but differs in the program wrapper and canned
+   cycles; Siemens 840D and Heidenhain are different languages outright;
+   LinuxCNC, Marlin and GRBL each reject parts of it.
+
+   Until those dialects exist, `generate-gcode` REFUSES an unimplemented
+   target rather than handing back Fanuc output under another machine's name.
+   A program that looks right and is addressed to the wrong control is worse
+   than an error: it reaches the machine."
+  #{:fanuc})
 (def gcode-units #{:millimeters :inches})
 (def coordinate-systems #{:g54 :g55 :g56 :g57 :g58 :g59})
 
@@ -31,7 +49,11 @@
    :safe-height 5.0
    :coordinate-system :g54
    :program-number 1
-   :coolant true})
+   :coolant true
+   ;; Used only when an operation carries no `:spindle-rpm`. Named so the
+   ;; fallback is visible in the config rather than buried as a literal in the
+   ;; tool-change line, where it silently overrode every operation's own speed.
+   :default-spindle-rpm 10000})
 
 (defn- header-lines [config]
   [ "%"
@@ -63,7 +85,39 @@
                        j (util/fixed (- (:y center) (:y start)) 4)]
                    (str "G03 X" x " Y" y " Z" z " I" i " J" j " F" (util/fixed feed-rate 1)))))))
 
-(defn- body-reducer [config state seg]
+(defn tool-numbers
+  "Map each distinct `:tool-id` in `segments` to the T number the post writes,
+   in first-appearance order (T01, T02, ...).
+
+   A tool id is not a tool number. This library's tool library is keyed by
+   whatever the caller chose — `:em6`, `\"6mm end mill\"`, 3 — while a controller
+   wants a small integer after `T`. Integer ids are used as-is so existing
+   numeric setups keep their numbers; everything else is assigned a number here.
+   Deterministic: the same job always yields the same T numbers."
+  [segments]
+  (->> segments
+       (map :tool-id)
+       (remove nil?)
+       distinct
+       (reduce (fn [{:keys [m next-n]} id]
+                 (if (integer? id)
+                   {:m (assoc m id id) :next-n next-n}
+                   {:m (assoc m id next-n) :next-n (inc next-n)}))
+               {:m {} :next-n 1})
+       :m))
+
+(defn- tool-change-lines
+  [config tools tool-id seg]
+  (let [n (get tools tool-id)
+        rpm (or (:spindle-rpm seg) (:default-spindle-rpm config))]
+    (cond-> [(str "T" (util/pad-int n 2) " M06 (tool change"
+                  (when-not (integer? tool-id) (str ": " (pr-str tool-id))) ")")
+             (str "M03 S" (util/round (double rpm)) " (spindle CW)")]
+      (nil? (:spindle-rpm seg))
+      (conj (str "(no spindle speed on this operation — using :default-spindle-rpm "
+                 (:default-spindle-rpm config) ")")))))
+
+(defn- body-reducer [config tools state seg]
   (let [{:keys [lines current-tool spindle-on]} state
         tool-id (:tool-id seg)
         coolant (:coolant config)
@@ -74,8 +128,7 @@
                       (if coolant (conj lines "M09 (coolant off)") lines))
                     lines)
             lines (conj lines (str "G00 Z" (util/fixed safe-height 4)))
-            lines (conj lines (str "T" (util/pad-int tool-id 2) " M06 (tool change)"))
-            lines (conj lines "M03 S10000 (spindle CW)")
+            lines (into lines (tool-change-lines config tools tool-id seg))
             lines (if coolant (conj lines "M08 (coolant on)") lines)]
         {:lines (conj lines (motion-line seg)) :current-tool tool-id :spindle-on true})
       {:lines (conj lines (motion-line seg)) :current-tool current-tool :spindle-on spindle-on})))
@@ -85,10 +138,20 @@
    (defaults to `default-config`)."
   ([segments] (generate-gcode segments default-config))
   ([segments config]
-   (let [coolant (:coolant config)
+   (let [post (:post-processor config)
+         _ (when-not (contains? implemented-post-processors post)
+             (throw (ex-info
+                     (str "post-processor " post " is named in `post-processors` but no dialect "
+                          "is implemented for it; the emitter would hand you ISO/Fanuc output "
+                          "labelled as " post)
+                     {:requested post
+                      :implemented implemented-post-processors
+                      :named post-processors})))
+         coolant (:coolant config)
          safe-height (:safe-height config)
+         tools (tool-numbers segments)
          init {:lines (header-lines config) :current-tool nil :spindle-on false}
-         {:keys [lines spindle-on]} (reduce (partial body-reducer config) init segments)
+         {:keys [lines spindle-on]} (reduce (partial body-reducer config tools) init segments)
          lines (if spindle-on
                  (let [lines (conj lines "M05 (spindle stop)")]
                    (if coolant (conj lines "M09 (coolant off)") lines))

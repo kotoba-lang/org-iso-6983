@@ -522,3 +522,81 @@
     (testing "and a target must be given"
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (toolpath/gouge-check segments nil {:tool-radius 3.0}))))))
+
+;; ---------------------------------------------------------------------
+;; holder-clearance / collision-check (2026-08-22)
+;;
+;; `gouge-check` looks at the TIP. The parts of a tool that reach a workpiece
+;; by being fat rather than by being low are the shank and the holder, and they
+;; are how a program that cuts exactly the right shape still wrecks a fixture.
+;; ---------------------------------------------------------------------
+
+(def ^:private ball-tool
+  {:id :bn6 :name "6mm ball" :tool-type :ball-nose :diameter 6.0 :flute-length 8.0
+   :overall-length 40.0 :holder-diameter 12.0 :flute-count 2 :corner-radius 3.0
+   :material :carbide})
+
+(def ^:private wall-target
+  ;; a floor at z=0, and a thin wall standing 25 mm tall just beyond it
+  {:positions [[-20 -20 0] [6 -20 0] [6 20 0] [-20 20 0]
+               [6 -20 0] [8 -20 0] [8 20 0] [6 20 0]
+               [6 -20 25] [8 -20 25] [8 20 25] [6 20 25]]
+   :indices [0 1 2 0 2 3  8 9 10 8 10 11]})
+
+(def ^:private narrow-slot
+  ;; a 5 mm slot — narrower than the 6 mm tool that is about to be pointed at it
+  {:positions [[-20 -20 10] [-2.5 -20 10] [-2.5 -20 0] [2.5 -20 0] [2.5 -20 10] [20 -20 10]
+               [-20 20 10] [-2.5 20 10] [-2.5 20 0] [2.5 20 0] [2.5 20 10] [20 20 10]]
+   :indices [0 1 7 0 7 6  1 2 8 1 8 7  2 3 9 2 9 8  3 4 10 3 10 9  4 5 11 4 11 10]})
+
+(defn- path-for [target]
+  (let [[lib _] (tool/add (tool/empty-library) ball-tool)]
+    (toolpath/generate-toolpath
+     (-> (toolpath/new-job (stock/stock (stock/block 60 60 30) (stock/aluminum-6061)) lib)
+         (toolpath/add-operation {:op :surface-3d :tool-id :bn6 :stepover 4.0
+                                  :strategy :raster :feed-rate 1200.0 :target target})))))
+
+(deftest the-envelope-above-the-tip-is-the-tool-that-was-programmed
+  (let [sections (toolpath/tool-envelope ball-tool)]
+    (is (= [[:shank 3.0 3.0 8.0] [:holder 6.0 8.0 40.0]]
+           (mapv (juxt :section-name-or-name :radius :z-low :z-high)
+                 (map #(assoc % :section-name-or-name (:name %)) sections))))))
+
+(deftest a-holder-collides-where-the-tip-is-perfectly-happy
+  (let [result (toolpath/collision-check (path-for wall-target) wall-target ball-tool
+                                         {:tolerance 0.02})]
+    (testing "the tip stays within its chord tolerance — the cut itself is right"
+      (is (:passed? (:gouge result)))
+      (is (<= (:worst-depth (:gouge result)) 0.01)))
+
+    (testing "and the holder is inside a 25 mm wall the whole time"
+      (is (not (:passed? (:above-tip result))))
+      (is (pos? (count (:violations (:above-tip result))))))
+
+    (testing "it is the HOLDER, not the shank — the section is named"
+      (is (= #{:holder} (set (map :section (:violations (:above-tip result)))))))
+
+    (testing "so the program as a whole is refused even though it cuts correctly"
+      (is (not (:passed? result))))))
+
+(deftest a-tool-too-fat-for-the-slot-is-caught-at-the-shank
+  (let [result (toolpath/collision-check (path-for narrow-slot) narrow-slot ball-tool)]
+    (testing "a 6 mm tool cannot machine a 5 mm slot, and the shank says so"
+      (is (contains? (set (map :section (:violations (:above-tip result)))) :shank)))))
+
+(deftest collision-check-says-what-it-still-does-not-model
+  (let [result (toolpath/collision-check (path-for wall-target) wall-target ball-tool)]
+    (is (= #{:gouge-into-target :shank-into-target :holder-into-target}
+           (:checked-for result)))
+    (testing "fixtures, clamps, the machine envelope and uncut stock are named as gaps"
+      (is (= #{:fixture-collision :clamp-collision :machine-envelope :uncut-stock}
+             (:not-checked-for result))))
+    (testing "the tool must be supplied — the envelope cannot be guessed"
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"tool"
+                            (toolpath/collision-check (path-for wall-target) wall-target {}))))))
+
+(deftest clearance-is-a-number-not-just-a-verdict
+  (let [flat {:positions [[-20 -20 0] [20 -20 0] [20 20 0] [-20 20 0]] :indices [0 1 2 0 2 3]}
+        tgt-flat (toolpath/collision-check (path-for flat) flat ball-tool {:tolerance 0.02})]
+    (testing "nothing stands near the tool over a flat plate"
+      (is (:passed? tgt-flat)))))

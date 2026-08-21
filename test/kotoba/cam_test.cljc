@@ -600,3 +600,101 @@
         tgt-flat (toolpath/collision-check (path-for flat) flat ball-tool {:tolerance 0.02})]
     (testing "nothing stands near the tool over a flat plate"
       (is (:passed? tgt-flat)))))
+
+;; ---------------------------------------------------------------------
+;; Multi-axis (2026-08-22)
+;;
+;; Every generator here assumed the tool stands along +Z. On a steep wall a
+;; vertical ball cuts with its side, where the effective cutting speed falls to
+;; nothing at the very centre of the tip — the finish is worst exactly where the
+;; tool is doing the work. That is what 5-axis is for.
+;; ---------------------------------------------------------------------
+
+(def ^:private ramp-target
+  ;; a 45-degree ramp: z = y, so the surface normal is (0, -1, 1)/sqrt(2)
+  {:positions [[-10 0 0] [10 0 0] [10 10 10] [-10 10 10]] :indices [0 1 2 0 2 3]})
+
+(defn- ramp-tris []
+  {:tris (mapv (fn [[a b c]] [(nth (:positions ramp-target) a)
+                              (nth (:positions ramp-target) b)
+                              (nth (:positions ramp-target) c)])
+               (partition 3 (:indices ramp-target)))})
+
+(deftest tool-axis-strategies-produce-the-angles-they-name
+  (let [t (ramp-tris)
+        root2 (/ 1.0 (Math/sqrt 2.0))]
+    (testing ":vertical is the 3-axis case"
+      (is (= [0.0 0.0 1.0] (toolpath/tool-axis t :vertical {:x 0 :y 5}))))
+
+    (testing ":surface-normal is the surface normal, exactly"
+      (let [n (toolpath/tool-axis t :surface-normal {:x 0 :y 5})]
+        (is (< (Math/abs (- (nth n 1) (- root2))) 1.0e-12))
+        (is (< (Math/abs (- (nth n 2) root2)) 1.0e-12))))
+
+    (testing ":lead-lag tilts off the normal by the angle asked for"
+      (let [n (toolpath/tool-axis t :surface-normal {:x 0 :y 5})
+            lead (toolpath/tool-axis t :lead-lag {:x 0 :y 5 :feed [1 0 0] :lead 0.2618})
+            between (Math/acos (reduce + (map * n lead)))]
+        (is (< (Math/abs (- between 0.2618)) 1.0e-9))))
+
+    (testing "an unknown strategy is refused, named against the ones that exist"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (toolpath/tool-axis t :swarf {:x 0 :y 5}))))))
+
+(deftest a-tilted-ball-touches-at-its-tip
+  ;; The geometric fact that makes this checkable: a ball nose aligned with the
+  ;; surface normal contacts AT ITS TIP, so the programmed tip IS the surface
+  ;; point. Standing upright, the same tool touches somewhere on the ball's
+  ;; flank and the tip has to be dropped for it — the whole of `ball-nose-drop`.
+  (let [[lib _] (tool/add (tool/empty-library) ball-tool)
+        segments (toolpath/generate-toolpath
+                  (-> (toolpath/new-job (stock/stock (stock/block 40 40 20)
+                                                     (stock/aluminum-6061)) lib)
+                      (toolpath/add-operation
+                       {:op :surface-5axis :tool-id :bn6 :stepover 4.0 :strategy :raster
+                        :axis-strategy :surface-normal :feed-rate 1200.0
+                        :target ramp-target})))
+        cuts (filter #(= :linear (:segment-type %)) segments)]
+    (is (> (count cuts) 10))
+    (testing "every programmed point is on the ramp, z = y"
+      (is (every? #(< (Math/abs (- (:z (:end %)) (:y (:end %)))) 1.0e-9) cuts)))
+    (testing "and every cutting move carries the axis it is cut along"
+      (is (every? :tool-axis cuts)))))
+
+(deftest tilting-is-the-difference-between-clearing-and-gouging
+  (let [t (ramp-tris)
+        tip [0.0 5.0 5.0]
+        along-normal (toolpath/multi-axis-clearance t ball-tool tip
+                                                    [0.0 (- (/ 1.0 (Math/sqrt 2.0)))
+                                                     (/ 1.0 (Math/sqrt 2.0))])
+        upright (toolpath/multi-axis-clearance t ball-tool tip [0.0 0.0 1.0])]
+    (testing "along the normal the tool touches and does not enter"
+      (is (empty? (:violations along-normal)))
+      (is (>= (:clearance along-normal) -1.0e-9)))
+    (testing "the SAME tool at the SAME point, stood upright, is inside the part"
+      (is (seq (:violations upright)))
+      (is (< (:clearance upright) -0.1)))
+    (testing "and the check says it is a sampled one"
+      (is (:sampled? along-normal))
+      (is (pos? (:samples along-normal))))))
+
+(deftest surface-5axis-refuses-what-belongs-to-the-3-axis-path
+  (let [[lib _] (tool/add (tool/empty-library) ball-tool)
+        job (fn [op] (-> (toolpath/new-job (stock/stock (stock/block 40 40 20)
+                                                        (stock/aluminum-6061)) lib)
+                         (toolpath/add-operation op)))]
+    (testing ":vertical is a 3-axis pass and is sent back to :surface-3d"
+      ;; Standing the tool on the contact point is not the same operation as
+      ;; dropping it onto the surface, and answering one with the other would
+      ;; cut a different shape.
+      (is (thrown-with-msg?
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"3-axis pass"
+           (toolpath/generate-toolpath
+            (job {:op :surface-5axis :tool-id :bn6 :stepover 4.0 :strategy :raster
+                  :axis-strategy :vertical :feed-rate 1200.0 :target ramp-target})))))
+    (testing "and only :raster exists here too"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (toolpath/generate-toolpath
+                    (job {:op :surface-5axis :tool-id :bn6 :stepover 4.0 :strategy :waterline
+                          :axis-strategy :surface-normal :feed-rate 1200.0
+                          :target ramp-target})))))))

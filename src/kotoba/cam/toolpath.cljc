@@ -9,6 +9,8 @@
      {:op :contour    :tool-id :depth :side :feed-rate :spindle-rpm}
      {:op :drill      :tool-id :depth :peck-depth :feed-rate :spindle-rpm :holes}
      {:op :surface-3d :tool-id :stepover :strategy :feed-rate :spindle-rpm}
+     {:op :surface-5axis :tool-id :stepover :strategy :axis-strategy :lead :tilt
+                         :feed-rate :spindle-rpm :target}
      {:op :turn       :tool-id :depth-of-cut :feed-rate :spindle-rpm}
 
    `:pocket` (zigzag), `:drill` (peck cycles), `:face-mill` (single-pass
@@ -55,14 +57,18 @@
    `generate-toolpath` stamps each operation's rpm onto the segments that
    operation produced (see there) — but a caller building segments by hand
    may pass it directly."
-  [{:keys [segment-type start end feed-rate center tool-id spindle-rpm]}]
+  [{:keys [segment-type start end feed-rate center tool-id spindle-rpm tool-axis]}]
   (cond-> {:segment-type segment-type
            :start start
            :end end
            :feed-rate (double (or feed-rate 0.0))
            :center center
            :tool-id tool-id}
-    (some? spindle-rpm) (assoc :spindle-rpm (double spindle-rpm))))
+    (some? spindle-rpm) (assoc :spindle-rpm (double spindle-rpm))
+    ;; A 3-axis segment has no axis field at all; a multi-axis one carries the
+    ;; unit vector the tool points along at its END. Absent means +Z, and the
+    ;; post has to be able to tell "upright" from "not stated".
+    (some? tool-axis) (assoc :tool-axis (vec tool-axis))))
 
 (defn- last-end
   "The end position of the last segment, or origin if empty."
@@ -703,6 +709,194 @@
       :not-checked-for #{:fixture-collision :clamp-collision :machine-envelope
                          :uncut-stock}})))
 
+
+;; ---------------------------------------------------------------------
+;; Multi-axis — the tool axis stops being +Z
+;; ---------------------------------------------------------------------
+
+(def tool-axis-strategies
+  "How the tool axis is chosen at a contact point."
+  #{:vertical :surface-normal :lead-lag})
+
+(defn- normalize3 [v]
+  (let [l (#?(:clj Math/sqrt :cljs js/Math.sqrt) (reduce + (map * v v)))]
+    (if (pos? l) (mapv #(/ % l) v) [0.0 0.0 1.0])))
+
+(defn- cross3 [[ax ay az] [bx by bz]]
+  [(- (* ay bz) (* az by)) (- (* az bx) (* ax bz)) (- (* ax by) (* ay bx))])
+
+(defn- rotate-about3
+  "Rodrigues rotation of `v` about unit `axis` by `angle` radians."
+  [v axis angle]
+  (let [c (Math/cos angle) s (Math/sin angle)
+        d (reduce + (map * axis v))]
+    (mapv (fn [vi ci ai] (+ (* vi c) (* ci s) (* ai d (- 1.0 c))))
+          v (cross3 axis v) axis)))
+
+(defn- triangle-normal-at
+  "Outward-ish normal of whichever triangle of `target` is under `[x y]`, or nil."
+  [target x y]
+  (some (fn [[a b c :as t]]
+          (when (tri-height-at t x y)
+            (let [n (normalize3 (cross3 (mapv - b a) (mapv - c a)))]
+              (if (neg? (nth n 2)) (mapv - n) n))))
+        (:tris target)))
+
+(defn tool-axis
+  "Unit tool-axis vector at `[x y]`, pointing from the contact point up the tool.
+
+  `:vertical` is the 3-axis case and is what every generator here assumed. The
+  others are why 5-axis exists: on a steep wall a vertical ball cuts with its
+  side, where the effective cutting speed falls to nothing at the very centre
+  of the tip and the finish is worst exactly where the tool is doing the work.
+
+  `:lead-lag` tilts away from the surface normal by `:lead` radians in the feed
+  direction and `:tilt` radians across it — the ordinary way to keep a real
+  cutting speed and to move the contact point off the tool centre."
+  [target strategy {:keys [x y feed lead tilt]}]
+  (when-not (contains? tool-axis-strategies strategy)
+    (throw (ex-info (str "unknown tool-axis strategy " strategy)
+                    {:strategy strategy :known (vec (sort tool-axis-strategies))})))
+  (case strategy
+    :vertical [0.0 0.0 1.0]
+    :surface-normal (or (triangle-normal-at target x y) [0.0 0.0 1.0])
+    :lead-lag (let [n (or (triangle-normal-at target x y) [0.0 0.0 1.0])
+                    f (normalize3 (or feed [1.0 0.0 0.0]))
+                    side (normalize3 (cross3 n f))
+                    ;; lead rotates in the plane spanned by n and the feed
+                    ;; direction, tilt in the plane across it
+                    a1 (rotate-about3 n side (double (or lead 0.0)))]
+                (normalize3 (rotate-about3 a1 f (double (or tilt 0.0)))))))
+
+(defn- point-segment-distance
+  "Distance from `p` to the segment `a`-`b`."
+  [p a b]
+  (let [ab (mapv - b a) ap (mapv - p a)
+        l2 (reduce + (map * ab ab))]
+    (if (< l2 1e-18)
+      (#?(:clj Math/sqrt :cljs js/Math.sqrt) (reduce + (map * ap ap)))
+      (let [t (max 0.0 (min 1.0 (/ (reduce + (map * ab ap)) l2)))
+            c (mapv (fn [ai abi] (+ ai (* t abi))) a ab)
+            d (mapv - p c)]
+        (#?(:clj Math/sqrt :cljs js/Math.sqrt) (reduce + (map * d d)))))))
+
+(defn- target-sample-points
+  "Vertices, edge midpoints and face centroids of `target`.
+
+  A FINITE sample. A tilted tool is a capsule in space rather than a height
+  above a point, so the height-field trick `gouge-check` uses does not apply and
+  this checks a sampled set instead. It can miss an intrusion that misses every
+  sample, and `:sampled?` on the result says so — an exact swept-volume test is
+  a different piece of work and is not pretended to be here."
+  [target]
+  (vec (distinct (mapcat (fn [[a b c]]
+                           [a b c
+                            (mapv #(/ (+ %1 %2) 2.0) a b)
+                            (mapv #(/ (+ %1 %2) 2.0) b c)
+                            (mapv #(/ (+ %1 %2) 2.0) c a)
+                            (mapv #(/ (+ %1 %2 %3) 3.0) a b c)])
+                         (:tris target)))))
+
+(defn multi-axis-clearance
+  "Clearance between a tool at `tip` pointing along unit `axis`, and `target`.
+
+  Works for ANY axis, which the vertical checkers do not: `gouge-check` and
+  `holder-clearance` both ask 'how high may the tool be here', a question that
+  only has an answer while the tool stands upright. Here each section of the
+  tool is a capsule and the question is a distance."
+  [target tool tip axis]
+  (let [ax (normalize3 axis)
+        r (/ (double (:diameter tool)) 2.0)
+        centre (mapv (fn [t a] (+ t (* r a))) tip ax)   ; ball centre
+        sections (tool-envelope tool)
+        pts (target-sample-points target)
+        seg (fn [{:keys [z-low z-high]}]
+              [(mapv (fn [t a] (+ t (* z-low a))) tip ax)
+               (mapv (fn [t a] (+ t (* z-high a))) tip ax)])
+        ball-gaps (map (fn [p] (- (point-segment-distance p centre centre) r)) pts)
+        sec-gaps (mapcat (fn [{:keys [name radius] :as sc}]
+                           (let [[a b] (seg sc)]
+                             (map (fn [p] {:section name
+                                           :gap (- (point-segment-distance p a b) radius)
+                                           :point p})
+                                  pts)))
+                         sections)
+        all (concat (map (fn [g p] {:section :ball :gap g :point p}) ball-gaps pts) sec-gaps)]
+    {:clearance (reduce min (map :gap all))
+     :samples (count pts)
+     :sampled? true
+     :violations (vec (filter #(neg? (:gap %)) all))}))
+
+(defn- gen-surface-5axis
+  "Raster finishing with a tool axis that follows the surface.
+
+  Geometry note that makes this checkable: a ball nose whose axis lies along the
+  surface normal touches the part AT ITS TIP, so the programmed tip is exactly
+  the surface point. In the 3-axis case the same tool touches somewhere on the
+  ball's flank and the tip has to be dropped for it — which is the whole of
+  `ball-nose-drop`. Tilting removes that step and replaces it with a rotation."
+  [job {:keys [tool-id stepover point-spacing strategy axis-strategy lead tilt
+               feed-rate target]} segments0]
+  (let [tool (get (:tool-library job) tool-id)
+        r (if tool (/ (:diameter tool) 2.0) 0.0)
+        step (if (and stepover (pos? stepover)) stepover (max r 0.5))
+        fstep (if (and point-spacing (pos? point-spacing)) point-spacing (/ step 2.0))
+        tgt (mesh-target target)
+        ax-strat (or axis-strategy :surface-normal)]
+    (cond
+      (not= :raster strategy)
+      (throw (ex-info (str "surface-5axis strategy " strategy
+                           " is not implemented; only :raster is")
+                      {:requested strategy :implemented #{:raster}}))
+      (nil? tgt)
+      (throw (ex-info "surface-5axis needs a :target mesh" {:target target}))
+      (= :vertical ax-strat)
+      (throw (ex-info (str "surface-5axis with :vertical is a 3-axis pass;"
+                           " use :surface-3d, which drops the tool onto the"
+                           " surface instead of standing it on the contact point")
+                      {:axis-strategy ax-strat}))
+      :else
+      (let [pts3 (mapcat identity (:tris tgt))
+            xs (map first pts3) ys (map second pts3)
+            x-min (apply min xs) x-max (apply max xs)
+            y-min (apply min ys) y-max (apply max ys)
+            safe-z (+ (apply max (map #(nth % 2) pts3)) (:safe-height job))
+            surface-at (fn [x y] (some (fn [t] (tri-height-at t x y)) (:tris tgt)))
+            at (fn [x y feed]
+                 (when-let [z (surface-at x y)]
+                   (let [a (tool-axis tgt ax-strat {:x x :y y :feed feed :lead lead :tilt tilt})]
+                     {:tip (vec3/v3 x y z) :axis a})))
+            row (fn [y forward]
+                  (let [feed (if forward [1.0 0.0 0.0] [-1.0 0.0 0.0])
+                        cols (range 0 (inc (Math/ceil (/ (- x-max x-min) fstep))))
+                        ps (keep (fn [i] (at (min x-max (+ x-min (* i fstep))) y feed)) cols)]
+                    (if forward (vec ps) (vec (reverse ps)))))]
+        (loop [y y-min forward true segs segments0]
+          (if (> y (+ y-max 1e-9))
+            (let [prev (last-end segs)]
+              (conj segs (segment {:segment-type :rapid :start prev
+                                   :end (vec3/v3 (:x prev) (:y prev) safe-z)
+                                   :tool-id tool-id})))
+            (let [ps (row y forward)]
+              (if (< (count ps) 2)
+                (recur (+ y step) (not forward) segs)
+                (let [prev (last-end segs)
+                      first-tip (:tip (first ps))
+                      segs (conj segs (segment {:segment-type :rapid :start prev
+                                                :end (vec3/v3 (:x first-tip) (:y first-tip) safe-z)
+                                                :tool-id tool-id}))
+                      segs (conj segs (segment {:segment-type :rapid
+                                                :start (vec3/v3 (:x first-tip) (:y first-tip) safe-z)
+                                                :end first-tip :tool-id tool-id
+                                                :tool-axis (:axis (first ps))}))
+                      segs (reduce (fn [acc [a b]]
+                                     (conj acc (segment {:segment-type :linear
+                                                         :start (:tip a) :end (:tip b)
+                                                         :feed-rate feed-rate :tool-id tool-id
+                                                         :tool-axis (:axis b)})))
+                                   segs (map vector ps (rest ps)))]
+                  (recur (+ y step) (not forward) segs))))))))))
+
 ;; ---------------------------------------------------------------------
 ;; CamJob
 ;; ---------------------------------------------------------------------
@@ -732,6 +926,7 @@
                    :contour (let [result (gen-contour job op segments)]
                               (if (= result segments) (gen-placeholder job op segments) result))
                                :surface-3d (gen-surface-3d job op segments)
+                   :surface-5axis (gen-surface-5axis job op segments)
                    :turn (gen-placeholder job op segments))]
        ;; Stamp this operation's spindle speed onto the segments it produced.
        ;; Done here rather than inside each generator so the ~18 `segment` call

@@ -536,6 +536,69 @@
 ;; Verification — did the path actually stay off the part?
 ;; ---------------------------------------------------------------------
 
+(defn- max-height-within
+  "Greatest target height within horizontal distance `radius` of `[x y]`, or nil.
+
+  The same sampling `ball-nose-drop` uses — face interiors on a grid, edges and
+  vertices exactly — but without the ball's lift term. A shank is a cylinder,
+  not a sphere: what matters is simply whether any material stands taller than
+  the bottom of that cylinder."
+  [target radius x y samples]
+  (let [tris (:tris target)
+        n (max 1 (long samples))
+        d2-of (fn [px py] (let [dx (- px x) dy (- py y)] (+ (* dx dx) (* dy dy))))
+        r2 (* radius radius)
+        grid (if (zero? radius)
+               [[x y]]
+               (for [i (range (inc n)) j (range (inc n))
+                     :let [px (+ x (* radius (- (/ (* 2.0 i) n) 1.0)))
+                           py (+ y (* radius (- (/ (* 2.0 j) n) 1.0)))]
+                     :when (<= (d2-of px py) r2)]
+                 [px py]))
+        grid-hits (for [[px py] grid t tris
+                        :let [h (tri-height-at t px py)] :when h]
+                    h)
+        edge-hits (for [[a b c] tris
+                        [p q] [[a b] [b c] [c a]]
+                        :let [[px py pz] (closest-on-segment p q x y)]
+                        :when (<= (d2-of px py) r2)]
+                    pz)
+        hits (concat grid-hits edge-hits)]
+    (when (seq hits) (reduce max hits))))
+
+(defn tool-envelope
+  "The tool above its tip, as cylindrical sections `{:name :radius :z-low :z-high}`
+  measured from the tip upward.
+
+  A 3-axis tool is a ball, then the flutes, then the holder, and each is a
+  different diameter at a different height. Only the first is what `gouge-check`
+  looks at; the parts that reach a workpiece by being FAT rather than by being
+  low are the other two, and they are how a program that cuts the right shape
+  still wrecks a fixture."
+  [{:keys [diameter flute-length overall-length holder-diameter]}]
+  (let [r (/ (double diameter) 2.0)
+        flute (double (or flute-length (* 4.0 diameter)))
+        overall (double (or overall-length (* 2.0 flute)))
+        hr (/ (double (or holder-diameter (* 2.0 diameter))) 2.0)]
+    (cond-> [{:name :shank :radius r :z-low r :z-high flute}]
+      (> overall flute) (conj {:name :holder :radius hr :z-low flute :z-high overall}))))
+
+(defn holder-clearance
+  "Clearance between the tool above its tip and `target`, at one tip position.
+
+  Returns `{:clearance :violations}`, one entry per section that the part
+  reaches into, with how deep. Positive `:clearance` is the smallest gap left
+  anywhere; negative means something is already inside the tool."
+  [target tool [x y z] samples]
+  (let [sections (tool-envelope tool)
+        results (keep (fn [{:keys [name radius z-low] :as sec}]
+                        (when-let [h (max-height-within target radius x y samples)]
+                          (let [gap (- (+ z z-low) h)]
+                            (assoc sec :section name :material-height h :gap gap))))
+                      sections)]
+    {:clearance (if (seq results) (reduce min (map :gap results)) ##Inf)
+     :violations (vec (filter #(neg? (:gap %)) results))}))
+
 (defn gouge-check
   "Does `segments` cut into `target` anywhere it should not?
 
@@ -592,6 +655,53 @@
         :checked-for #{:gouge-into-target}
         :not-checked-for #{:holder-collision :shank-collision :fixture-collision
                            :machine-envelope :rapid-moves}}))))
+
+(defn collision-check
+  "Both checks a 3-axis program needs against the part: the tip must not cut
+  into it (`gouge-check`) and nothing above the tip may pass through it
+  (`holder-clearance`).
+
+  Rapid moves ARE included in the shank and holder pass. A rapid at safe height
+  is not automatically safe: the tool is still in space, and a feature taller
+  than the retract clears the flutes and meets the holder.
+
+  ⚠ Still not modelled: fixtures, clamps, the machine's own envelope, and the
+  workpiece as it exists BEFORE the cut — the target is the finished shape, so
+  a shank passing through stock that has not been removed yet is not seen here.
+  `:not-checked-for` says so on the result."
+  ([segments target tool] (collision-check segments target tool {}))
+  ([segments target tool {:keys [tolerance samples drop-samples]
+                          :or {tolerance 1.0e-6 samples 8 drop-samples 8}}]
+   (let [tgt (mesh-target target)
+         _ (when-not tgt (throw (ex-info "collision-check needs a :target mesh" {:target target})))
+         _ (when-not (:diameter tool)
+             (throw (ex-info (str "collision-check needs the tool it was programmed for;"
+                                  " the envelope above the tip is what it checks and"
+                                  " cannot be guessed")
+                             {:tool tool})))
+         r (/ (double (:diameter tool)) 2.0)
+         gouge (gouge-check segments target {:tool-radius r :tolerance tolerance
+                                             :samples samples :drop-samples drop-samples})
+         n (max 1 (long samples))
+         above (vec (for [[i sg] (map-indexed vector segments)
+                          k (range (inc n))
+                          :let [t (/ (double k) n)
+                                {:keys [start end]} sg
+                                p [(+ (:x start) (* t (- (:x end) (:x start))))
+                                   (+ (:y start) (* t (- (:y end) (:y start))))
+                                   (+ (:z start) (* t (- (:z end) (:z start))))]
+                                c (holder-clearance tgt tool p drop-samples)]
+                          v (:violations c)
+                          :when (< (:gap v) (- tolerance))]
+                      (assoc v :segment i :segment-type (:segment-type sg) :point p)))]
+     {:tool-radius r
+      :sections (tool-envelope tool)
+      :gouge gouge
+      :above-tip {:violations above :passed? (empty? above)}
+      :passed? (and (:passed? gouge) (empty? above))
+      :checked-for #{:gouge-into-target :shank-into-target :holder-into-target}
+      :not-checked-for #{:fixture-collision :clamp-collision :machine-envelope
+                         :uncut-stock}})))
 
 ;; ---------------------------------------------------------------------
 ;; CamJob

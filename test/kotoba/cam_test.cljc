@@ -347,3 +347,102 @@
                      (gcode/generate-gcode segments (assoc gcode/default-config
                                                            :post-processor post)))
             (str post " must be refused while its dialect is unimplemented"))))))
+
+;; ---------------------------------------------------------------------
+;; :surface-3d — ball-nose raster finishing (2026-08-22)
+;;
+;; Before this, `:surface-3d` returned a rapid move to the tool-change point
+;; for every one of the four strategies `surface-strategies` names. A job that
+;; looks generated and removes nothing is worse than an error: it reaches the
+;; machine.
+;; ---------------------------------------------------------------------
+
+(def ^:private plateau-target
+  ;; a 6x6 plateau at z=4 sitting on a plane at z=0
+  {:positions [[-20 -20 0] [20 -20 0] [20 20 0] [-20 20 0]
+               [-3 -3 4] [3 -3 4] [3 3 4] [-3 3 4]]
+   :indices [0 1 2 0 2 3 4 5 6 4 6 7]})
+
+(defn- tris-of [{:keys [positions indices]}]
+  {:tris (mapv (fn [[a b c]] [(nth positions a) (nth positions b) (nth positions c)])
+               (partition 3 indices))})
+
+(deftest ball-nose-drop-is-exact-on-edges
+  ;; The ball centre rests at max over the disc of (h + sqrt(r^2 - d^2)); the
+  ;; tip is r below it. On flat ground that reduces to the surface height, which
+  ;; is why sampling only the point under the axis LOOKS right — it agrees
+  ;; everywhere flat and gouges every convex feature by up to r.
+  ;;
+  ;; A grid alone is not enough either. Measured with a 24x24 grid, x=5.9 came
+  ;; out at 1.000 against a true 1.768: a 0.77mm gouge into the plateau edge
+  ;; that no amount of looking at the path would show. Edges and vertices are
+  ;; now sampled directly.
+  (let [t (tris-of plateau-target) r 3.0]
+    (doseq [[x expected] [[0.0 4.0]        ; on the plateau
+                          [2.9 4.0]        ; still on it
+                          [4.0 3.828]      ; riding the edge, d=1
+                          [5.0 3.236]      ; d=2
+                          [5.9 1.768]      ; d=2.9 — the case a grid misses
+                          [6.5 0.0]        ; out of reach, back on the plane
+                          [10.0 0.0]]]
+      (testing (str "x=" x)
+        (is (< (Math/abs (- (toolpath/ball-nose-drop t r x 0.0 12) expected)) 0.002))))
+
+    (testing "nothing under the tool is nil, not zero"
+      (is (nil? (toolpath/ball-nose-drop {:tris []} r 0.0 0.0 12))))))
+
+(deftest surface-3d-cuts-and-follows-the-target
+  (let [[lib _] (tool/add (tool/empty-library)
+                          {:id :bn6 :name "6mm ball" :tool-type :ball-nose :diameter 6.0
+                           :flute-length 20.0 :overall-length 60.0 :flute-count 2
+                           :corner-radius 3.0 :material :carbide})
+        job (fn [strategy] (-> (toolpath/new-job (stock/stock (stock/block 60 60 20)
+                                                              (stock/aluminum-6061)) lib)
+                               (toolpath/add-operation
+                                {:op :surface-3d :tool-id :bn6 :stepover 4.0
+                                 :strategy strategy :feed-rate 1200.0 :spindle-rpm 12000
+                                 :target plateau-target})))
+        segments (toolpath/generate-toolpath (job :raster))
+        cuts (filter #(= :linear (:segment-type %)) segments)]
+
+    (testing "it cuts — this is the whole point"
+      (is (> (count cuts) 20)))
+
+    (testing "every cutting move carries the operation's feed rate"
+      (is (every? #(= 1200.0 (:feed-rate %)) cuts)))
+
+    (testing "the path follows the target: it reaches the plateau and the floor"
+      (let [zs (map #(:z (:end %)) cuts)]
+        (is (< (Math/abs (- (apply max zs) 4.0)) 1.0e-6))
+        (is (< (Math/abs (apply min zs)) 1.0e-6))))
+
+    (testing "and never dips below the floor it is finishing"
+      (is (every? #(> (:z (:end %)) -1.0e-9) cuts)))))
+
+(deftest unimplemented-surface-strategies-are-refused-not-faked
+  (testing "the named set is larger than the implemented set, and says so"
+    (is (contains? toolpath/surface-strategies :waterline))
+    (is (not (contains? toolpath/implemented-surface-strategies :waterline)))
+    (is (contains? toolpath/implemented-surface-strategies :raster)))
+
+  (let [[lib _] (tool/add (tool/empty-library)
+                          {:id :bn6 :name "6mm ball" :tool-type :ball-nose :diameter 6.0
+                           :flute-length 20.0 :overall-length 60.0 :flute-count 2
+                           :corner-radius 3.0 :material :carbide})
+        job (fn [op] (-> (toolpath/new-job (stock/stock (stock/block 60 60 20)
+                                                        (stock/aluminum-6061)) lib)
+                         (toolpath/add-operation op)))]
+    (testing "a strategy with no generator throws instead of emitting a rapid"
+      (doseq [s (disj toolpath/surface-strategies :raster)]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                     (toolpath/generate-toolpath
+                      (job {:op :surface-3d :tool-id :bn6 :stepover 4.0 :strategy s
+                            :feed-rate 1200.0 :target plateau-target})))
+            (str s " must be refused while it has no generator"))))
+
+    (testing "and a surface pass with no target is refused too"
+      (is (thrown-with-msg?
+           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #":target"
+           (toolpath/generate-toolpath
+            (job {:op :surface-3d :tool-id :bn6 :stepover 4.0 :strategy :raster
+                  :feed-rate 1200.0})))))))

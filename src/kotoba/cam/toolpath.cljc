@@ -26,7 +26,23 @@
             [kotoba.cam.util :as util]))
 
 (def pocket-strategies #{:zigzag :spiral :trochoidal-peel})
-(def surface-strategies #{:raster :spiral :waterline :pencil})
+(def surface-strategies
+  "3-axis surface finishing strategies this library *names*. Naming one is not
+   implementing one — see `implemented-surface-strategies`."
+  #{:raster :spiral :waterline :pencil})
+
+(def implemented-surface-strategies
+  "The subset `generate-toolpath` actually cuts.
+
+   `:raster` drops a ball-nose over a triangle-mesh target on a parallel-line
+   grid, which is the finishing pass most 3-axis work uses. `:waterline` needs
+   constant-Z contours of the part (a different algorithm), `:spiral` needs a
+   boundary-offset field, and `:pencil` needs concave-edge detection. Until
+   those exist, an operation naming them is REFUSED rather than handed a rapid
+   move to the tool-change point and called a finishing pass — a job that looks
+   generated and removes nothing is worse than an error, because it reaches the
+   machine."
+  #{:raster})
 (def contour-sides #{:inside :outside :on-line})
 (def segment-types #{:rapid :linear :arc-cw :arc-ccw})
 
@@ -301,6 +317,177 @@
                     :end (vec3/v3 0.0 0.0 (:safe-height job))
                     :tool-id tool-id}))))
 
+
+;; ---------------------------------------------------------------------
+;; :surface-3d — ball-nose raster finishing over a mesh target
+;; ---------------------------------------------------------------------
+
+(defn- tri-height-at
+  "Height of triangle `[a b c]` above `[x y]`, or nil when the point is outside
+   it. Barycentric, so a point on a shared edge belongs to both triangles and
+   the max below is unaffected."
+  [[a b c] x y]
+  (let [[ax ay az] a [bx by bz] b [cx cy cz] c
+        d (- (* (- by cy) (- ax cx)) (* (- bx cx) (- ay cy)))]
+    (when (> (#?(:clj Math/abs :cljs js/Math.abs) d) 1e-12)
+      (let [l1 (/ (+ (* (- by cy) (- x cx)) (* (- cx bx) (- y cy))) d)
+            l2 (/ (+ (* (- cy ay) (- x cx)) (* (- ax cx) (- y cy))) d)
+            l3 (- 1.0 l1 l2)
+            e -1e-9]
+        (when (and (>= l1 e) (>= l2 e) (>= l3 e))
+          (+ (* l1 az) (* l2 bz) (* l3 cz)))))))
+
+(defn- closest-on-segment
+  "The point of segment a-b closest to `[x y]`, in XY, lifted to its own Z."
+  [[ax ay az] [bx by bz] x y]
+  (let [dx (- bx ax) dy (- by ay)
+        len2 (+ (* dx dx) (* dy dy))]
+    (if (< len2 1e-18)
+      [ax ay az]
+      (let [t (max 0.0 (min 1.0 (/ (+ (* (- x ax) dx) (* (- y ay) dy)) len2)))]
+        [(+ ax (* t dx)) (+ ay (* t dy)) (+ az (* t (- bz az)))]))))
+
+(defn ball-nose-drop
+  "Programmed Z of a ball-nose tool at `[x y]` above `target` — the TIP, which
+   is what a controller is fed — or nil when nothing is under the tool.
+
+   The ball centre rests at `max over the disc of (h + sqrt(r^2 - d^2))`, the
+   exact non-penetration condition on a height field, and the tip is `r` below
+   it. On a flat plateau that reduces to the surface height, which is why a
+   naive implementation that samples only the point under the axis looks right:
+   it agrees everywhere flat, and gouges every convex feature by up to `r`
+   exactly where the part is not flat.
+
+   **Contacts on edges and vertices are sampled exactly, face interiors on a
+   grid.** A square grid alone under-cuts a sharp edge by however much the
+   spacing misses it — measured on a 6x6 plateau with a 6mm ball, a 24x24 grid
+   put the tip at 1.000 where the true edge contact is 1.768, a 0.77mm gouge
+   that no amount of eyeballing the path would reveal. Each triangle's vertices
+   and the closest point on each of its edges are therefore sampled directly,
+   which is exact for a polyhedral target except where the contact lands in a
+   face's interior — there the grid decides, and `drop-samples` sets its
+   resolution."
+  [target r x y samples]
+  (let [tris (:tris target)
+        n (max 1 (long samples))
+        lift (fn [d2] (when (<= d2 (* r r))
+                        (#?(:clj Math/sqrt :cljs js/Math.sqrt) (- (* r r) d2))))
+        d2-of (fn [px py] (let [dx (- px x) dy (- py y)] (+ (* dx dx) (* dy dy))))
+        ;; contacts on a face interior: a grid over the disc
+        grid (if (zero? r)
+               [[x y]]
+               (for [i (range (inc n)) j (range (inc n))
+                     :let [px (+ x (* r (- (/ (* 2.0 i) n) 1.0)))
+                           py (+ y (* r (- (/ (* 2.0 j) n) 1.0)))]
+                     :when (<= (d2-of px py) (* r r))]
+                 [px py]))
+        grid-hits (for [[px py] grid
+                        t tris
+                        :let [h (tri-height-at t px py)
+                              l (lift (d2-of px py))]
+                        :when (and h l)]
+                    (+ h l))
+        ;; contacts on an edge or a vertex: sampled exactly, not approached
+        edge-hits (for [[a b c] tris
+                        [p q] [[a b] [b c] [c a]]
+                        :let [[px py pz] (closest-on-segment p q x y)
+                              l (lift (d2-of px py))]
+                        :when l]
+                    (+ pz l))
+        hits (concat grid-hits edge-hits)]
+    (when (seq hits) (- (reduce max hits) r))))
+
+(defn- mesh-target
+  "Normalise an operation's `:target` into `{:tris [...]}`, or nil."
+  [target]
+  (when target
+    (let [vs (vec (:positions target (:vertices target)))
+          idx (vec (:indices target))]
+      (when (and (seq vs) (seq idx))
+        {:tris (mapv (fn [[a b c]]
+                       [(let [p (nth vs a)] (if (map? p) [(:x p) (:y p) (:z p)] (vec p)))
+                        (let [p (nth vs b)] (if (map? p) [(:x p) (:y p) (:z p)] (vec p)))
+                        (let [p (nth vs c)] (if (map? p) [(:x p) (:y p) (:z p)] (vec p)))])
+                     (partition 3 idx))}))))
+
+(defn- gen-surface-3d
+  [job {:keys [tool-id stepover strategy feed-rate target drop-samples]} segments0]
+  (let [tool (get (:tool-library job) tool-id)
+        r (if tool (/ (:diameter tool) 2.0) 0.0)
+        step (if (and stepover (pos? stepover)) stepover (max r 0.5))
+        tgt (mesh-target target)]
+    (cond
+      (not (contains? implemented-surface-strategies strategy))
+      (throw (ex-info (str "surface-3d strategy " strategy
+                           " is named in `surface-strategies` but no generator is"
+                           " implemented for it; refusing rather than emitting a"
+                           " rapid move and calling it a finishing pass")
+                      {:requested strategy
+                       :implemented implemented-surface-strategies
+                       :named surface-strategies}))
+
+      (nil? tgt)
+      (throw (ex-info (str "surface-3d needs a :target mesh to drop the tool onto"
+                           " ({:positions [...] :indices [...]}); without one there"
+                           " is no surface to finish")
+                      {:op :surface-3d :target target}))
+
+      :else
+      (let [pts3 (mapcat identity (:tris tgt))
+            xs (map first pts3)
+            ys (map second pts3)
+            ;; Retract height comes from the TARGET, not the stock: a surface
+            ;; finishing pass is defined by the part it is finishing, and this
+            ;; way the operation does not depend on how the caller happened to
+            ;; describe the raw material.
+            safe-z (+ (apply max (map #(nth % 2) pts3)) (:safe-height job))
+            ;; The raster covers the target's own footprint, not the footprint
+            ;; grown by the tool radius. Points whose AXIS is off the target are
+            ;; skipped below: there the ball rolls off the edge and the drop
+            ;; descends by up to r, which is a correct answer to the wrong
+            ;; question — a finishing pass is bounded by the surface it finishes.
+            ;; Measured before this: the path dived to z = -3 outside a plane at
+            ;; z = 0.
+            x-min (apply min xs) x-max (apply max xs)
+            y-min (apply min ys) y-max (apply max ys)
+            samples (or drop-samples 4)
+            row (fn [y forward]
+                  (let [cols (range 0 (inc (Math/ceil (/ (- x-max x-min) step))))
+                        over? (fn [x] (some #(tri-height-at % x y) (:tris tgt)))
+                        pts (keep (fn [i]
+                                    (let [x (min x-max (+ x-min (* i step)))]
+                                      (when (over? x)
+                                        (when-let [z (ball-nose-drop tgt r x y samples)]
+                                          (vec3/v3 x y z)))))
+                                  cols)]
+                    (if forward (vec pts) (vec (reverse pts)))))
+            segments (if (seq segments0)
+                       (conj segments0 (segment {:segment-type :rapid :start (last-end segments0)
+                                                 :end (vec3/v3 x-min y-min safe-z)
+                                                 :tool-id tool-id}))
+                       segments0)]
+        (loop [y y-min forward true segs segments]
+          (if (> y (+ y-max 1e-9))
+            (let [prev (last-end segs)]
+              (conj segs (segment {:segment-type :rapid :start prev
+                                   :end (vec3/v3 (:x prev) (:y prev) safe-z)
+                                   :tool-id tool-id})))
+            (let [pts (row y forward)]
+              (if (< (count pts) 2)
+                (recur (+ y step) (not forward) segs)
+                (let [prev (last-end segs)
+                      segs (conj segs (segment {:segment-type :rapid :start prev
+                                                :end (vec3/v3 (:x (first pts)) (:y (first pts)) safe-z)
+                                                :tool-id tool-id}))
+                      segs (conj segs (segment {:segment-type :rapid
+                                                :start (vec3/v3 (:x (first pts)) (:y (first pts)) safe-z)
+                                                :end (first pts) :tool-id tool-id}))
+                      segs (reduce (fn [acc [a b]]
+                                     (conj acc (segment {:segment-type :linear :start a :end b
+                                                         :feed-rate feed-rate :tool-id tool-id})))
+                                   segs (map vector pts (rest pts)))]
+                  (recur (+ y step) (not forward) segs))))))))))
+
 ;; ---------------------------------------------------------------------
 ;; CamJob
 ;; ---------------------------------------------------------------------
@@ -329,7 +516,8 @@
                    :face-mill (gen-face-mill job op segments)
                    :contour (let [result (gen-contour job op segments)]
                               (if (= result segments) (gen-placeholder job op segments) result))
-                   (:surface-3d :turn) (gen-placeholder job op segments))]
+                               :surface-3d (gen-surface-3d job op segments)
+                   :turn (gen-placeholder job op segments))]
        ;; Stamp this operation's spindle speed onto the segments it produced.
        ;; Done here rather than inside each generator so the ~18 `segment` call
        ;; sites stay unchanged: the rpm is a property of the operation, and the

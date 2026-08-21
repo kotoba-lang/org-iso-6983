@@ -446,3 +446,79 @@
            (toolpath/generate-toolpath
             (job {:op :surface-3d :tool-id :bn6 :stepover 4.0 :strategy :raster
                   :feed-rate 1200.0})))))))
+
+;; ---------------------------------------------------------------------
+;; gouge-check (2026-08-22)
+;;
+;; Generating a finishing pass and verifying one are different claims. The
+;; checker was written to verify `:surface-3d`, and the first thing it did was
+;; fail the path that generator produced — by 0.365 mm, into the part.
+;; ---------------------------------------------------------------------
+
+(defn- surface-job [lib opts]
+  (-> (toolpath/new-job (stock/stock (stock/block 60 60 20) (stock/aluminum-6061)) lib)
+      (toolpath/add-operation (merge {:op :surface-3d :tool-id :bn6 :stepover 4.0
+                                      :strategy :raster :feed-rate 1200.0
+                                      :target plateau-target}
+                                     opts))))
+
+(defn- ball-lib []
+  (first (tool/add (tool/empty-library)
+                   {:id :bn6 :name "6mm ball" :tool-type :ball-nose :diameter 6.0
+                    :flute-length 20.0 :overall-length 60.0 :flute-count 2
+                    :corner-radius 3.0 :material :carbide})))
+
+(deftest a-generated-pass-passes-its-own-gouge-check
+  (let [lib (ball-lib)
+        segments (toolpath/generate-toolpath (surface-job lib {}))
+        result (toolpath/gouge-check segments plateau-target
+                                     {:tool-radius 3.0 :tolerance 0.02})]
+    (testing "something was actually checked — no samples is not a pass"
+      (is (pos? (:checked result))))
+    (is (:passed? result))
+    (testing "and the chord tolerance is honoured, not merely accepted"
+      (is (<= (:worst-depth result) 0.01)))))
+
+(deftest the-chord-tolerance-is-a-real-knob
+  (let [lib (ball-lib)
+        worst (fn [opts]
+                (:worst-depth (toolpath/gouge-check
+                               (toolpath/generate-toolpath (surface-job lib opts))
+                               plateau-target {:tool-radius 3.0})))]
+    (testing "without refinement the path cuts half a millimetre into the part"
+      ;; A ball pivoting on a sharp edge has a VERTICAL tangent; uniform
+      ;; spacing converges there at a crawl, which is why refinement is
+      ;; adaptive rather than just finer.
+      (is (> (worst {:max-bisections 0}) 0.4)))
+    (testing "a loose tolerance is met loosely and a tight one tightly"
+      (is (<= (worst {:chord-tolerance 0.05}) 0.05))
+      (is (<= (worst {:chord-tolerance 0.01}) 0.01)))))
+
+(deftest gouge-check-reports-and-refuses-rather-than-repairs
+  (let [lib (ball-lib)
+        segments (toolpath/generate-toolpath (surface-job lib {}))
+        sunk (mapv (fn [s] (if (= :linear (:segment-type s))
+                             (-> s (update :start #(vec3/v3 (:x %) (:y %) (- (:z %) 0.5)))
+                                 (update :end #(vec3/v3 (:x %) (:y %) (- (:z %) 0.5))))
+                             s))
+                   segments)
+        bad (toolpath/gouge-check sunk plateau-target {:tool-radius 3.0})]
+    (testing "a path pushed 0.5 mm down is caught, and the depth is named"
+      (is (not (:passed? bad)))
+      (is (seq (:violations bad)))
+      (is (> (:worst-depth bad) 0.4))
+      (is (every? #(and (:segment %) (:programmed-z %) (:allowed-z %)) (:violations bad))))
+
+    (testing "it says what it did NOT check"
+      ;; A path that passes this can still crash a machine.
+      (is (= #{:gouge-into-target} (:checked-for bad)))
+      (is (contains? (:not-checked-for bad) :holder-collision))
+      (is (contains? (:not-checked-for bad) :fixture-collision)))
+
+    (testing "the tool radius must be given, because the allowed height depends on it"
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #":tool-radius"
+                            (toolpath/gouge-check segments plateau-target {}))))
+
+    (testing "and a target must be given"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (toolpath/gouge-check segments nil {:tool-radius 3.0}))))))

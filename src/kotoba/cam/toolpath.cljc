@@ -411,10 +411,22 @@
                      (partition 3 idx))}))))
 
 (defn- gen-surface-3d
-  [job {:keys [tool-id stepover strategy feed-rate target drop-samples]} segments0]
+  [job {:keys [tool-id stepover point-spacing chord-tolerance max-bisections
+               strategy feed-rate target drop-samples]} segments0]
   (let [tool (get (:tool-library job) tool-id)
         r (if tool (/ (:diameter tool) 2.0) 0.0)
+        ;; `:stepover` is the LATERAL spacing between passes and sets the
+        ;; scallop height. `:point-spacing` is the FORWARD spacing along a pass
+        ;; and sets the chord error — how far the straight move between two
+        ;; sampled points cuts inside the surface it is following. They are
+        ;; different quantities and the first version used one number for both:
+        ;; `gouge-check` put the resulting path 0.365 mm into the part, on the
+        ;; plateau edge where the surface changes fastest. The default keeps the
+        ;; forward step an eighth of the lateral one, which is the usual order.
         step (if (and stepover (pos? stepover)) stepover (max r 0.5))
+        fstep (if (and point-spacing (pos? point-spacing)) point-spacing (/ step 8.0))
+        chord-tol (double (or chord-tolerance 0.01))
+        max-bisect (long (or max-bisections 12))
         tgt (mesh-target target)]
     (cond
       (not (contains? implemented-surface-strategies strategy))
@@ -452,14 +464,45 @@
             y-min (apply min ys) y-max (apply max ys)
             samples (or drop-samples 4)
             row (fn [y forward]
-                  (let [cols (range 0 (inc (Math/ceil (/ (- x-max x-min) step))))
+                  (let [cols (range 0 (inc (Math/ceil (/ (- x-max x-min) fstep))))
                         over? (fn [x] (some #(tri-height-at % x y) (:tris tgt)))
-                        pts (keep (fn [i]
-                                    (let [x (min x-max (+ x-min (* i step)))]
-                                      (when (over? x)
-                                        (when-let [z (ball-nose-drop tgt r x y samples)]
-                                          (vec3/v3 x y z)))))
-                                  cols)]
+                        at (fn [x] (when (over? x)
+                                     (when-let [z (ball-nose-drop tgt r x y samples)]
+                                       (vec3/v3 x y z))))
+                        coarse (vec (keep (fn [i] (at (min x-max (+ x-min (* i fstep))))) cols))
+                        ;; Uniform spacing cannot make the chord error small where
+                        ;; the tool-centre path has a vertical tangent — a ball
+                        ;; pivoting on a sharp edge does, and refining uniformly
+                        ;; converges there at a crawl. Measured: 0.365 mm inside
+                        ;; the part at fstep = stepover, still 0.194 mm at 0.1 mm
+                        ;; spacing. So bisect only where the straight move
+                        ;; actually sags past `chord-tol`, and cap the depth so a
+                        ;; genuine discontinuity cannot spin forever.
+                        ;; The refinement criterion samples the SAME way the
+                        ;; checker does. Testing only the midpoint passed
+                        ;; intervals whose sag peaks off-centre — which it does
+                        ;; near a vertical tangent — and left 0.061 mm in the
+                        ;; part no matter how tight the tolerance was set.
+                        sag (fn [a b]
+                              (let [dz (- (:z b) (:z a))
+                                    dx (- (:x b) (:x a))]
+                                (reduce max 0.0
+                                        (keep (fn [t]
+                                                (when-let [m (at (+ (:x a) (* t dx)))]
+                                                  (- (:z m) (+ (:z a) (* t dz)))))
+                                              [0.125 0.25 0.375 0.5 0.625 0.75 0.875]))))
+                        refine (fn refine [a b depth]
+                                 (if (or (>= depth max-bisect) (<= (sag a b) chord-tol))
+                                   [b]
+                                   (let [m (at (/ (+ (:x a) (:x b)) 2.0))]
+                                     (if m
+                                       (into (refine a m (inc depth)) (refine m b (inc depth)))
+                                       [b]))))
+                        pts (if (< (count coarse) 2)
+                              coarse
+                              (into [(first coarse)]
+                                    (mapcat (fn [[a b]] (refine a b 0))
+                                            (map vector coarse (rest coarse)))))]
                     (if forward (vec pts) (vec (reverse pts)))))
             segments (if (seq segments0)
                        (conj segments0 (segment {:segment-type :rapid :start (last-end segments0)
@@ -487,6 +530,68 @@
                                                          :feed-rate feed-rate :tool-id tool-id})))
                                    segs (map vector pts (rest pts)))]
                   (recur (+ y step) (not forward) segs))))))))))
+
+
+;; ---------------------------------------------------------------------
+;; Verification — did the path actually stay off the part?
+;; ---------------------------------------------------------------------
+
+(defn gouge-check
+  "Does `segments` cut into `target` anywhere it should not?
+
+   Generating a finishing pass and verifying one are different claims, and
+   until now only the first was made. This checks the second, and only the
+   second: at sampled points along every cutting move it recomputes the height
+   the tool tip is allowed to reach and reports where the programmed tip is
+   below it.
+
+   Returns `{:tool-radius :tolerance :samples :checked :violations :worst-depth
+   :passed?}` — `:violations` naming the segment index, the point, the
+   programmed z, the allowed z and the depth. A gouge is reported, never
+   corrected: a checker that quietly moves the path is no longer a checker.
+
+   ⚠ **This is gouge detection against the target, and nothing else.** Tool
+   HOLDER and shank collision, fixtures, clamps and the machine's own envelope
+   are not modelled here — `holder-clearance` and a full `collision-check` do
+   not exist. A path that passes this can still crash a machine, and saying so
+   is the point."
+  ([segments target] (gouge-check segments target {}))
+  ([segments target {:keys [tool-radius tolerance samples drop-samples]
+                     :or {tolerance 1.0e-6 samples 8 drop-samples 8}}]
+   (let [tgt (mesh-target target)]
+     (when-not tgt
+       (throw (ex-info "gouge-check needs a :target mesh to check against"
+                       {:target target})))
+     (when-not (and (number? tool-radius) (>= tool-radius 0))
+       (throw (ex-info (str "gouge-check needs the :tool-radius the path was"
+                            " generated for; the allowed height depends on it,"
+                            " and guessing would pass a path that gouges")
+                       {:tool-radius tool-radius})))
+     (let [cuts (keep-indexed (fn [i sg] (when (= :linear (:segment-type sg)) [i sg])) segments)
+           n (max 1 (long samples))
+           results
+           (for [[i {:keys [start end]}] cuts
+                 k (range (inc n))
+                 :let [t (/ (double k) n)
+                       x (+ (:x start) (* t (- (:x end) (:x start))))
+                       y (+ (:y start) (* t (- (:y end) (:y start))))
+                       z (+ (:z start) (* t (- (:z end) (:z start))))
+                       allowed (ball-nose-drop tgt tool-radius x y drop-samples)]
+                 :when allowed]
+             {:segment i :point [x y z] :programmed-z z :allowed-z allowed
+              :depth (- allowed z)})
+           violations (vec (filter #(> (:depth %) tolerance) results))]
+       {:tool-radius tool-radius
+        :tolerance tolerance
+        :samples n
+        :checked (count results)
+        :violations violations
+        :worst-depth (if (seq results) (reduce max (map :depth results)) 0.0)
+        ;; No samples means nothing was checked. That is not a pass.
+        :passed? (and (pos? (count results)) (empty? violations))
+        :checked-for #{:gouge-into-target}
+        :not-checked-for #{:holder-collision :shank-collision :fixture-collision
+                           :machine-envelope :rapid-moves}}))))
 
 ;; ---------------------------------------------------------------------
 ;; CamJob

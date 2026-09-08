@@ -3,7 +3,7 @@
    and assertions mirror the originals so this file is directly diffable
    against the recovered Rust source (see README for the recovery command)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.cam.gcode :as gcode]
             [kotoba.cam.stock :as stock]
             [kotoba.cam.tool :as tool]

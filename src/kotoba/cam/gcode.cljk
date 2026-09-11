@@ -40,7 +40,7 @@
     :g54 "G54" :g55 "G55" :g56 "G56" :g57 "G57" :g58 "G58" :g59 "G59"))
 
 ;; Canonical source: resources/kotoba/cam/gcode-defaults.edn (kept in sync,
-;; see test/kotoba/cam/materials_edn_test.clj). Embedded as a literal here so
+;; see test/kotoba/cam/materials_edn_test.cljk). Embedded as a literal here so
 ;; this domain namespace has no file IO.
 (def default-config
   {:machine-type :mill-3axis

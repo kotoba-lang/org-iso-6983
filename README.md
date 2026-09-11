@@ -121,8 +121,8 @@ never drift apart.
 original Rust scope) for `:face-mill` and `:contour`.
 
 ```sh
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 ```
 
 ## Intentionally unported

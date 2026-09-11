@@ -108,13 +108,13 @@ constant tables, now data:
 `kotoba.cam.stock` / `kotoba.cam.gcode` keep a literal copy of these tables
 rather than reading the resource files at namespace load — that keeps the
 domain namespaces free of file IO and portable to cljs/wasm.
-`test/kotoba/cam/materials_edn_test.clj` (JVM-only, the one place allowed to
+`test/kotoba/cam/materials_edn_test.cljk` (JVM-only, the one place allowed to
 touch `clojure.java.io`) asserts the embedded literals and the `.edn` files
 never drift apart.
 
 ## Tests
 
-`test/kotoba/cam_test.cljc` ports the 5 test cases from the Rust crate's
+`test/kotoba/cam_test.cljk` ports the 5 test cases from the Rust crate's
 `src/tests.rs` 1:1 (`tool-library-crud`, `gcode-header-footer-valid`,
 `gcode-arc-output`, `pocket-toolpath-generates-segments`,
 `material-presets`) as parity tests, plus new coverage (beyond the

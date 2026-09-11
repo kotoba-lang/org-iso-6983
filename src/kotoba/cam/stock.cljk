@@ -34,7 +34,7 @@
 
 ;; Canonical table lives in resources/kotoba/cam/materials.edn. This literal
 ;; is kept byte-for-byte in sync with that file (verified by
-;; test/kotoba/cam/materials_edn_test.clj) rather than loaded via file IO at
+;; test/kotoba/cam/materials_edn_test.cljk) rather than loaded via file IO at
 ;; namespace init, so this domain namespace stays free of IO and portable to
 ;; cljs/wasm.
 (def material-presets

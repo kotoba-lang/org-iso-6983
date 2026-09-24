@@ -14,7 +14,7 @@
    unchanged from before the tx-data wrap."
   (:require [kotoba.test :refer [deftest is]]
             [clojure.java.io :as io]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [kotoba.cam.stock :as stock]
             [kotoba.cam.gcode :as gcode]))
 

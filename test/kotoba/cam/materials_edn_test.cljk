@@ -12,7 +12,7 @@
    :kotoba.cam.* namespace, edn/read-string's any blob strings) so the
    drift comparison below is against the original bare-keyed map shape,
    unchanged from before the tx-data wrap."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [clojure.java.io :as io]
             [clojure.edn :as edn]
             [kotoba.cam.stock :as stock]

@@ -314,7 +314,7 @@
 
   (testing "pad-int refuses a non-number instead of formatting NaN"
     (is (= "07" (util/pad-int 7 2)))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (util/pad-int :em6 2)))))
 
 (deftest spindle-speed-comes-from-the-operation
@@ -343,7 +343,7 @@
       (is (str/includes? (gcode/generate-gcode segments gcode/default-config) "M30")))
     (testing "an unimplemented target throws instead of returning Fanuc output under its name"
       (doseq [post (disj gcode/post-processors :fanuc)]
-        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+        (is (thrown? js/Error
                      (gcode/generate-gcode segments (assoc gcode/default-config
                                                            :post-processor post)))
             (str post " must be refused while its dialect is unimplemented"))))))
@@ -434,7 +434,7 @@
                          (toolpath/add-operation op)))]
     (testing "a strategy with no generator throws instead of emitting a rapid"
       (doseq [s (disj toolpath/surface-strategies :raster)]
-        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+        (is (thrown? js/Error
                      (toolpath/generate-toolpath
                       (job {:op :surface-3d :tool-id :bn6 :stepover 4.0 :strategy s
                             :feed-rate 1200.0 :target plateau-target})))
@@ -442,7 +442,7 @@
 
     (testing "and a surface pass with no target is refused too"
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #":target"
+           js/Error #":target"
            (toolpath/generate-toolpath
             (job {:op :surface-3d :tool-id :bn6 :stepover 4.0 :strategy :raster
                   :feed-rate 1200.0})))))))
@@ -516,11 +516,11 @@
       (is (contains? (:not-checked-for bad) :fixture-collision)))
 
     (testing "the tool radius must be given, because the allowed height depends on it"
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #":tool-radius"
+      (is (thrown-with-msg? js/Error #":tool-radius"
                             (toolpath/gouge-check segments plateau-target {}))))
 
     (testing "and a target must be given"
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (toolpath/gouge-check segments nil {:tool-radius 3.0}))))))
 
 ;; ---------------------------------------------------------------------
@@ -592,7 +592,7 @@
       (is (= #{:fixture-collision :clamp-collision :machine-envelope :uncut-stock}
              (:not-checked-for result))))
     (testing "the tool must be supplied — the envelope cannot be guessed"
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"tool"
+      (is (thrown-with-msg? js/Error #"tool"
                             (toolpath/collision-check (path-for wall-target) wall-target {}))))))
 
 (deftest clearance-is-a-number-not-just-a-verdict
@@ -638,7 +638,7 @@
         (is (< (Math/abs (- between 0.2618)) 1.0e-9))))
 
     (testing "an unknown strategy is refused, named against the ones that exist"
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (toolpath/tool-axis t :swarf {:x 0 :y 5}))))))
 
 (deftest a-tilted-ball-touches-at-its-tip
@@ -688,12 +688,12 @@
       ;; dropping it onto the surface, and answering one with the other would
       ;; cut a different shape.
       (is (thrown-with-msg?
-           #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"3-axis pass"
+           js/Error #"3-axis pass"
            (toolpath/generate-toolpath
             (job {:op :surface-5axis :tool-id :bn6 :stepover 4.0 :strategy :raster
                   :axis-strategy :vertical :feed-rate 1200.0 :target ramp-target})))))
     (testing "and only :raster exists here too"
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+      (is (thrown? js/Error
                    (toolpath/generate-toolpath
                     (job {:op :surface-5axis :tool-id :bn6 :stepover 4.0 :strategy :waterline
                           :axis-strategy :surface-normal :feed-rate 1200.0

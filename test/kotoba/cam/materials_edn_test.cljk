@@ -13,7 +13,7 @@
    drift comparison below is against the original bare-keyed map shape,
    unchanged from before the tx-data wrap."
   (:require [kotoba.test :refer [deftest is]]
-            [clojure.java.io :as io]
+            [kotoba.io :as io]
             [kotoba.lang.edn :as edn]
             [kotoba.cam.stock :as stock]
             [kotoba.cam.gcode :as gcode]))

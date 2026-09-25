@@ -1,5 +1,10 @@
 {:paths ["src" "resources"]
  :deps {
+        ;; kotoba.io replaced clojure.java.io here (2026-09-24). An explicit floor:
+        ;; kotoba.io carries clojure.java.io's file/as-file/as-relative-path/
+        ;; make-parents/delete-file from 98045c7, and tools.deps takes the NEWEST
+        ;; sha it is shown.
+        io.github.kotoba-lang/io {:git/sha "72dde04b4c32854d70d17a670b277f8f7957a784"}
         ;; kotoba.lang.edn replaced clojure.edn here (2026-09-23). An explicit floor:
         ;; tools.deps takes the NEWEST sha it is shown, and kbb resolves git deps
         ;; only from nbb.edn, so every project file this repo has names it.

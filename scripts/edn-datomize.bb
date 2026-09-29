@@ -169,7 +169,7 @@
 ;; キーはそのまま使う。値は classify/attr-value で scalar はそのまま、
 ;; 非scalar(入れ子 map/vector-of-map)は pr-str blob にする。
 ;; :related/:supersedes/:superseded_by は ADR-id と生ドキュメントパスが混在する
-;; 実データ（例: 2607011345 の :related は ["CLAUDE.md" "....md" ...]）ため、
+;; 実データ（例: 2607011345 の :related は ["AGENTS.md" "....md" ...]）ため、
 ;; Datomic lookup-ref 化はせず素の文字列 vector のまま保持する。
 
 (defn adr-key [k]
